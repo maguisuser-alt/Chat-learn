@@ -1,6 +1,8 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { useCloudDoc } from "@/lib/useCloudDoc";
+import { mergeSettings, type SyncState } from "@/lib/syncMerge";
 
 export type ResponseLength = "breve" | "normal" | "detallada";
 export type VoiceEngine = "browser" | "natural";
@@ -26,6 +28,10 @@ export interface Settings {
   gems: Gem[];
   reasoningDefault: boolean;
   voice: { engine: VoiceEngine; name: string; autoRead: boolean; dictationLang: string };
+  /** Momento del último cambio (para fusionar entre dispositivos). */
+  updatedAt: number;
+  /** Ids de memorias y asistentes borrados (para que el borrado llegue a otros dispositivos). */
+  removed: string[];
 }
 
 export const LIMITS = { about: 1500, style: 1500, gemInstructions: 4000, memory: 200, memories: 60, gems: 30 };
@@ -37,6 +43,8 @@ export const DEFAULT_SETTINGS: Settings = {
   gems: [],
   reasoningDefault: false,
   voice: { engine: "browser", name: "Kore", autoRead: false, dictationLang: "es-ES" },
+  updatedAt: 0,
+  removed: [],
 };
 
 /** Plantillas para crear asistentes con un clic. */
@@ -99,8 +107,13 @@ function normalize(raw: unknown): Settings {
     gems: Array.isArray(s.gems) ? s.gems : [],
     reasoningDefault: s.reasoningDefault ?? false,
     voice: { ...DEFAULT_SETTINGS.voice, ...(s.voice ?? {}) },
+    updatedAt: typeof s.updatedAt === "number" ? s.updatedAt : 0,
+    removed: Array.isArray(s.removed) ? s.removed.filter((x) => typeof x === "string") : [],
   };
 }
+
+/** Marca el cambio con la hora, para que gane frente a copias más antiguas de otros dispositivos. */
+const touched = (s: Settings): Settings => ({ ...s, updatedAt: Date.now() });
 
 interface SettingsApi {
   settings: Settings;
@@ -109,12 +122,23 @@ interface SettingsApi {
   removeMemory: (id: string) => void;
   saveGem: (gem: Gem) => void;
   removeGem: (id: string) => void;
+  /** Estado de la sincronización con la cuenta. */
+  syncStatus: SyncState;
 }
 
 const SettingsContext = createContext<SettingsApi | null>(null);
 
 /** Ajustes de la cuenta, guardados en el navegador (separados por usuario). */
-export function SettingsProvider({ userId, children }: { userId: string | null; children: React.ReactNode }) {
+export function SettingsProvider({
+  userId,
+  sync = false,
+  children,
+}: {
+  userId: string | null;
+  /** Sincronizar con la cuenta (MongoDB). */
+  sync?: boolean;
+  children: React.ReactNode;
+}) {
   const key = `lingua-settings:${userId ?? "anon"}`;
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
@@ -138,7 +162,16 @@ export function SettingsProvider({ userId, children }: { userId: string | null; 
     }
   }, [settings, key, loadedKey]);
 
-  const update = useCallback((patch: Partial<Settings>) => setSettings((s) => ({ ...s, ...patch })), []);
+  const syncStatus = useCloudDoc<Settings>({
+    kind: "settings",
+    enabled: sync,
+    loadedKey: loadedKey === key ? key : null,
+    value: settings,
+    apply: (fn) => setSettings((s) => fn(s)),
+    merge: (local, remote) => mergeSettings(local, normalize(remote), LIMITS.memories, LIMITS.gems),
+  });
+
+  const update = useCallback((patch: Partial<Settings>) => setSettings((s) => touched({ ...s, ...patch })), []);
 
   const addMemory = useCallback(
     (text: string) =>
@@ -149,13 +182,14 @@ export function SettingsProvider({ userId, children }: { userId: string | null; 
         const norm = (x: string) => x.toLowerCase().replace(/\W+/g, " ").trim();
         if (s.memories.some((m) => norm(m.text) === norm(t))) return s;
         const memories = [...s.memories, { id: uid(), text: t, createdAt: Date.now() }].slice(-LIMITS.memories);
-        return { ...s, memories };
+        return touched({ ...s, memories });
       }),
     []
   );
 
   const removeMemory = useCallback(
-    (id: string) => setSettings((s) => ({ ...s, memories: s.memories.filter((m) => m.id !== id) })),
+    (id: string) =>
+      setSettings((s) => touched({ ...s, memories: s.memories.filter((m) => m.id !== id), removed: [...s.removed, id].slice(-400) })),
     []
   );
 
@@ -170,19 +204,20 @@ export function SettingsProvider({ userId, children }: { userId: string | null; 
         };
         const exists = s.gems.some((g) => g.id === gem.id);
         const gems = exists ? s.gems.map((g) => (g.id === gem.id ? clean : g)) : [...s.gems, clean].slice(-LIMITS.gems);
-        return { ...s, gems };
+        return touched({ ...s, gems });
       }),
     []
   );
 
   const removeGem = useCallback(
-    (id: string) => setSettings((s) => ({ ...s, gems: s.gems.filter((g) => g.id !== id) })),
+    (id: string) =>
+      setSettings((s) => touched({ ...s, gems: s.gems.filter((g) => g.id !== id), removed: [...s.removed, id].slice(-400) })),
     []
   );
 
   const api = useMemo(
-    () => ({ settings, update, addMemory, removeMemory, saveGem, removeGem }),
-    [settings, update, addMemory, removeMemory, saveGem, removeGem]
+    () => ({ settings, update, addMemory, removeMemory, saveGem, removeGem, syncStatus }),
+    [settings, update, addMemory, removeMemory, saveGem, removeGem, syncStatus]
   );
   return <SettingsContext.Provider value={api}>{children}</SettingsContext.Provider>;
 }

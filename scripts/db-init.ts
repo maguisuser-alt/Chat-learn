@@ -9,6 +9,8 @@ import { Conversation } from "../models/Conversation";
 import { Feedback } from "../models/Feedback";
 import { StudyGuide } from "../models/StudyGuide";
 import { StudyPlan } from "../models/StudyPlan";
+import { UserData } from "../models/UserData";
+import { ChatThread } from "../models/ChatThread";
 
 async function main() {
   try {
@@ -37,7 +39,7 @@ async function main() {
     return 1;
   }
 
-  const models = [User, UserProgress, Interaction, Conversation, Feedback, StudyGuide, StudyPlan];
+  const models = [User, UserProgress, UserData, ChatThread, Interaction, Conversation, Feedback, StudyGuide, StudyPlan];
   for (const m of models) {
     try {
       await m.createCollection();

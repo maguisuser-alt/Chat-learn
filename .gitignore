@@ -11,3 +11,9 @@ next-env.d.ts
 *.out
 *.err
 *.tmp
+
+# Vercel
+.vercel
+
+.vercel
+.env*

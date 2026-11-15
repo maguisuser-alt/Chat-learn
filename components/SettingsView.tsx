@@ -22,6 +22,7 @@ import {
   Volume2,
 } from "lucide-react";
 import { useTheme, type ThemePref } from "@/lib/theme";
+import { combineSync } from "@/lib/syncMerge";
 import { useInstallPrompt } from "@/lib/useInstallPrompt";
 import SettingsBar from "@/components/SettingsBar";
 import { LEVELS } from "@/lib/schemas";
@@ -158,7 +159,9 @@ function GemForm({ initial, onSave, onCancel }: { initial: Gem; onSave: (g: Gem)
 }
 
 export default function SettingsView({ profile, onProfileChange, history, section, user, syncStatus, onUseGem }: Props) {
-  const { settings, update, addMemory, removeMemory, saveGem, removeGem } = useSettings();
+  const { settings, update, addMemory, removeMemory, saveGem, removeGem, syncStatus: settingsSync } = useSettings();
+  const cloud = user.authEnabled && !!user.email;
+  const allSync = combineSync(syncStatus, settingsSync);
   const [editingGem, setEditingGem] = useState<Gem | null>(null);
   const [newMemory, setNewMemory] = useState("");
   const [shareData, setShareData] = useState<boolean | null>(null);
@@ -231,7 +234,10 @@ export default function SettingsView({ profile, onProfileChange, history, sectio
   }
 
   function clearBrowserData() {
-    if (!window.confirm("Se borrará de este navegador tu historial de chats, ajustes, memoria, asistentes, progreso y caché. ¿Continuar?")) return;
+    const msg = cloud
+      ? "Se borrará la copia de este navegador (chats, ajustes, memoria, asistentes, tarjetas, progreso y caché). Lo guardado en tu cuenta no se borra y volverá a cargarse. ¿Continuar?"
+      : "Se borrará de este navegador tu historial de chats, ajustes, memoria, asistentes, progreso y caché. ¿Continuar?";
+    if (!window.confirm(msg)) return;
     const suffix = user.userId ?? "anon";
     const remove: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
@@ -582,7 +588,15 @@ export default function SettingsView({ profile, onProfileChange, history, sectio
         </div>
       </Section>
 
-      <Section id="data" title="Datos y privacidad" desc="El historial, la memoria y los asistentes se guardan en este navegador.">
+      <Section
+        id="data"
+        title="Datos y privacidad"
+        desc={
+          cloud
+            ? "Tus chats, memoria, asistentes, tarjetas, perfil y progreso se guardan en tu cuenta y en este navegador: los verás en cualquier dispositivo donde inicies sesión."
+            : "El historial, la memoria y los asistentes se guardan solo en este navegador."
+        }
+      >
         <div className={`${card} space-y-4`}>
           {shareData !== null ? (
             <Toggle
@@ -605,7 +619,13 @@ export default function SettingsView({ profile, onProfileChange, history, sectio
               type="button"
               disabled={!history.chats.length}
               onClick={() => {
-                if (window.confirm(`¿Borrar los ${history.chats.length} chats del historial?`)) {
+                if (
+                  window.confirm(
+                    cloud
+                      ? `¿Borrar los ${history.chats.length} chats del historial? Se borrarán también de tu cuenta y de tus otros dispositivos.`
+                      : `¿Borrar los ${history.chats.length} chats del historial?`
+                  )
+                ) {
                   history.clearAll();
                   flash("Historial borrado.");
                 }
@@ -634,9 +654,15 @@ export default function SettingsView({ profile, onProfileChange, history, sectio
               <>
                 <p className="truncate font-semibold">{user.name ?? "Usuario"}</p>
                 <p className="truncate text-sm text-slate-500">{user.email}</p>
-                <p className="text-xs text-slate-400">
-                  Progreso de idiomas:{" "}
-                  {syncStatus === "ok" ? "sincronizado" : syncStatus === "syncing" ? "sincronizando…" : syncStatus === "error" ? "solo en este navegador" : "—"}
+                <p className={`text-xs ${allSync === "error" ? "text-amber-700" : "text-slate-400"}`}>
+                  Sincronización con tu cuenta:{" "}
+                  {allSync === "ok"
+                    ? "al día"
+                    : allSync === "syncing"
+                      ? "sincronizando…"
+                      : allSync === "error"
+                        ? "sin conexión con la base de datos (los cambios se guardan aquí y se subirán después)"
+                        : "—"}
                 </p>
               </>
             ) : (

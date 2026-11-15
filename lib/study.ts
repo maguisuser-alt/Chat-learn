@@ -18,6 +18,10 @@ export interface Deck {
   /** Chat del que salió el mazo (si aplica). */
   chatId?: string;
   cards: StudyCard[];
+  /** Momento del último cambio (para fusionar entre dispositivos). */
+  updatedAt?: number;
+  /** Ids de tarjetas borradas (para que el borrado llegue a otros dispositivos). */
+  removedCards?: string[];
 }
 
 export interface QuizQuestion {
@@ -49,7 +53,7 @@ export function newCards(raw: { front: string; back: string }[], now: number, ex
 }
 
 export function createDeck(title: string, raw: { front: string; back: string }[], now: number, chatId?: string): Deck {
-  return { id: uid(), title: title.trim() || "Mazo sin título", createdAt: now, chatId, cards: newCards(raw, now) };
+  return { id: uid(), title: title.trim() || "Mazo sin título", createdAt: now, updatedAt: now, chatId, cards: newCards(raw, now) };
 }
 
 /** Estado de la tarjeta tras responder «la sabía» (correct) o «no la sabía». */

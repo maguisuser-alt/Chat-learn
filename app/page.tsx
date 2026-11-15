@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AudioLines,
   BarChart3,
@@ -30,6 +30,8 @@ import LanguageBar from "@/components/language/LanguageBar";
 import ProgressStats from "@/components/language/ProgressStats";
 import CardsView from "@/components/study/CardsView";
 import { useDecks } from "@/lib/useDecks";
+import { useCloudDoc } from "@/lib/useCloudDoc";
+import { combineSync, newest } from "@/lib/syncMerge";
 import { dueWords } from "@/lib/srs";
 import Logo from "@/components/Logo";
 import UserMenu from "@/components/UserMenu";
@@ -60,26 +62,40 @@ const GROUPS: { id: Group; label: string }[] = [
   { id: "language", label: "Idiomas" },
 ];
 
-/** Perfil (idioma, nivel, IA) guardado por usuario en el navegador. */
-function useProfile(userId: string | null) {
+type StoredProfile = Profile & { updatedAt?: number };
+
+/** Perfil (idioma, nivel, IA) guardado por usuario en el navegador y, con cuenta, en MongoDB. */
+function useProfile(userId: string | null, sync: boolean) {
   const key = userId ? `lingua-profile:${userId}` : "lingua-profile";
-  const [profile, setProfile] = useState<Profile>(DEFAULT_PROFILE);
+  const [stored, setStored] = useState<StoredProfile>(DEFAULT_PROFILE);
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
   useEffect(() => {
     try {
       const raw = localStorage.getItem(key) ?? (userId ? localStorage.getItem("lingua-profile") : null);
-      setProfile(raw ? { ...DEFAULT_PROFILE, ...JSON.parse(raw) } : DEFAULT_PROFILE);
+      setStored(raw ? { ...DEFAULT_PROFILE, ...JSON.parse(raw) } : DEFAULT_PROFILE);
     } catch {
-      setProfile(DEFAULT_PROFILE); // perfil corrupto
+      setStored(DEFAULT_PROFILE); // perfil corrupto
     }
+    setLoadedKey(key);
   }, [key, userId]);
-  const update = useCallback(
-    (p: Profile) => {
-      setProfile(p);
-      localStorage.setItem(key, JSON.stringify(p));
-    },
-    [key]
+  useEffect(() => {
+    if (loadedKey === key) localStorage.setItem(key, JSON.stringify(stored));
+  }, [stored, key, loadedKey]);
+  const syncStatus = useCloudDoc<StoredProfile>({
+    kind: "profile",
+    enabled: sync,
+    loadedKey: loadedKey === key ? key : null,
+    value: stored,
+    apply: (fn) => setStored((s) => fn(s)),
+    merge: (local, remote) => newest(local, { ...DEFAULT_PROFILE, ...remote }),
+  });
+  const update = useCallback((p: Profile) => setStored({ ...p, updatedAt: Date.now() }), []);
+  // Objeto estable mientras no cambie el perfil (hay efectos que dependen de él).
+  const profile = useMemo<Profile>(
+    () => ({ language: stored.language, level: stored.level, provider: stored.provider }),
+    [stored.language, stored.level, stored.provider]
   );
-  return [profile, update] as const;
+  return [profile, update, syncStatus] as const;
 }
 
 /** Lista de chats recientes del menú lateral. */
@@ -132,11 +148,13 @@ function ChatList({ history, onPick }: { history: ChatHistoryApi; onPick: () => 
 export default function Home() {
   const user = useCurrentUser();
   const userId = user.ready ? user.userId : null;
-  const [profile, setProfile] = useProfile(userId);
-  // Con cuenta de Google el progreso también se guarda en el servidor.
-  const progressApi = useProgress(profile.language, userId, user.authEnabled && !!user.email);
-  const history = useChatHistory(userId);
-  const decks = useDecks(userId);
+  // Con cuenta de Google todo se guarda también en MongoDB para verlo en cualquier dispositivo.
+  const cloud = user.authEnabled && !!user.email;
+  const [profile, setProfile, profileSync] = useProfile(userId, cloud);
+  const progressApi = useProgress(profile.language, userId, cloud);
+  const history = useChatHistory(userId, cloud);
+  const decks = useDecks(userId, cloud);
+  const syncStatus = combineSync(progressApi.syncStatus, history.syncStatus, decks.syncStatus, profileSync);
   const [tab, setTab] = useState<Tab>("chat");
   const [settingsSection, setSettingsSection] = useState<string | undefined>();
   /** Abre Lecciones directamente en el test de nivel (una sola vez). */
@@ -168,7 +186,7 @@ export default function Home() {
   const fullHeight = ["chat", "cards", "voice", "lessons", "stats", "media", "games"].includes(tab);
 
   return (
-    <SettingsProvider userId={userId}>
+    <SettingsProvider userId={userId} sync={cloud}>
       <div className="flex h-dvh bg-white">
         {/* Fondo oscuro del menú en móvil */}
         {menuOpen && (
@@ -247,7 +265,7 @@ export default function Home() {
                 name={user.name}
                 email={user.email}
                 avatar={user.avatar}
-                syncStatus={progressApi.syncStatus}
+                syncStatus={syncStatus}
                 onOpenSettings={() => openSettings("account")}
               />
             )}
@@ -278,7 +296,7 @@ export default function Home() {
               <>
                 {tab === "chat" && (
                   <ChatTutor
-                    key={history.active.id}
+                    key={`${history.active.id}:${history.revision}`}
                     profile={profile}
                     history={history}
                     onOpenSettings={openSettings}
@@ -324,7 +342,7 @@ export default function Home() {
                       history={history}
                       section={settingsSection}
                       user={{ ...user, userId }}
-                      syncStatus={progressApi.syncStatus}
+                      syncStatus={syncStatus}
                       onUseGem={(gemId) => newChat(gemId)}
                     />
                   )}

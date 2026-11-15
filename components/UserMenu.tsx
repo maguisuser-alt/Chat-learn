@@ -4,6 +4,8 @@ import { useState } from "react";
 import { signOut } from "next-auth/react";
 import { LogOut, Settings, UserCircle } from "lucide-react";
 import type { SyncStatus } from "@/lib/progress";
+import { useSettings } from "@/lib/settings";
+import { combineSync } from "@/lib/syncMerge";
 
 interface Props {
   name: string | null;
@@ -16,12 +18,14 @@ interface Props {
 const SYNC_LABEL: Record<SyncStatus, { text: string; cls: string } | null> = {
   off: null,
   syncing: { text: "Sincronizando…", cls: "text-slate-400" },
-  ok: { text: "Progreso sincronizado", cls: "text-brand-700" },
+  ok: { text: "Datos sincronizados", cls: "text-brand-700" },
   error: { text: "Sin sincronizar (solo en este navegador)", cls: "text-amber-600" },
 };
 
 export default function UserMenu({ name, email, avatar, syncStatus = "off", onOpenSettings }: Props) {
-  const sync = SYNC_LABEL[syncStatus];
+  // Se suma la sincronización de los ajustes (memoria, asistentes), que vive en su propio contexto.
+  const settingsSync = useSettings().syncStatus;
+  const sync = SYNC_LABEL[combineSync(syncStatus, settingsSync)];
   const [open, setOpen] = useState(false);
 
   return (

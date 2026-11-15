@@ -1,0 +1,12 @@
+# No subir secretos, registros ni archivos locales al desplegar con la CLI.
+.env
+.env*.local
+node_modules
+.next
+*.log
+*.out
+*.err
+*.tmp
+*.tsbuildinfo
+vercel-env.mjs
+vercel-deploy.cmd
