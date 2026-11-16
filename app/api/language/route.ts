@@ -4,6 +4,7 @@ import { friendlyAIError, runWithFallback } from "@/lib/ai";
 import { LEVELS } from "@/lib/schemas";
 import { searchVideos } from "@/lib/youtube";
 import { cleanQuestions } from "@/lib/placement";
+import { cleanStops, MAX_CLIP_SECONDS, type ClipStop } from "@/lib/clipQuiz";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -23,6 +24,14 @@ const requestSchema = z.discriminatedUnion("action", [
     ...base,
   }),
   z.object({ action: z.literal("placement"), ...base }),
+  z.object({
+    action: z.literal("clip"),
+    videoId: z.string().regex(/^[\w-]{6,20}$/),
+    /** Serie o película, para dar contexto a la IA. */
+    title: z.string().trim().max(160).default(""),
+    duration: z.number().positive().max(MAX_CLIP_SECONDS).optional(),
+    ...base,
+  }),
   z.object({
     action: z.literal("media"),
     title: z.string().trim().min(2).max(120),
@@ -56,6 +65,30 @@ const placementSchema = z.object({
     )
     .min(18)
     .max(26),
+});
+
+const clipSchema = z.object({
+  summary: z.string().describe("De qué trata el clip, en español, una o dos frases"),
+  spokenLanguage: z.string().describe("Idioma que se habla en el clip, en español (p. ej. «Inglés»)"),
+  stops: z
+    .array(
+      z.object({
+        kind: z
+          .enum(["meaning", "gap", "speak"])
+          .describe("meaning: adivinar el significado de una expresión; gap: completar palabras; speak: repetir la frase"),
+        start: z.number().describe("Segundo exacto del clip en que EMPIEZA a decirse la frase"),
+        time: z.number().describe("Segundo exacto del clip en que TERMINA de decirse la frase (ahí se pausa)"),
+        quote: z.string().describe("La frase EXACTA que se oye, palabra por palabra, en el idioma del clip"),
+        translation: z.string().describe("Traducción natural al español"),
+        expression: z.string().optional().describe("Solo meaning: la expresión o modismo de la frase"),
+        options: z.array(z.string()).optional().describe("Solo meaning: 3 significados en español, uno correcto"),
+        answer: z.number().int().optional().describe("Solo meaning: índice (0-2) del significado correcto"),
+        hidden: z.array(z.string()).optional().describe("Solo gap: 1-3 palabras sueltas de quote que se ocultan"),
+        tip: z.string().describe("Consejo breve en español: uso, pronunciación o contexto"),
+      })
+    )
+    .min(1)
+    .max(10),
 });
 
 const mediaSchema = z.object({
@@ -161,6 +194,51 @@ Revisa que la opción indicada en "answer" sea realmente la única correcta.`,
       return Response.json({ questions, verification });
     }
 
+    if (data.action === "clip") {
+      // Solo Gemini puede ver vídeos de YouTube (los analiza a partir de la URL).
+      const { object } = await runWithFallback(
+        data.provider,
+        (model, _id, abortSignal) =>
+          generateObject({
+            model,
+            maxRetries: 1,
+            abortSignal,
+            schema: clipSchema,
+            providerOptions: { google: { mediaResolution: "MEDIA_RESOLUTION_LOW" } },
+            system: `Eres un profesor de ${data.language} que prepara ejercicios sobre clips de series y películas, como en las apps de idiomas con vídeo.
+Ves y escuchas el clip completo. Eliges entre 4 y 6 momentos en los que un personaje dice una frase clara y útil para un estudiante de nivel ${data.level}, repartidos a lo largo del clip.
+Reglas:
+- "quote" debe ser exactamente lo que se oye (no lo inventes ni lo resumas). Si no se entiende bien, elige otra frase.
+- "start" y "time" son los segundos reales del clip en que empieza y termina la frase. Sé preciso: el vídeo se pausará en "time".
+- Mezcla los tipos: al menos uno de cada (meaning, gap, speak) si el clip lo permite. meaning solo cuando la frase tenga una expresión o modismo.
+- Las opciones de meaning: una correcta y dos plausibles pero incorrectas, en español.
+- En gap oculta palabras clave sueltas (no artículos) que se oigan con claridad.
+- Si el clip no está en ${data.language} o casi no tiene diálogo, indícalo en spokenLanguage y devuelve las frases que haya.`,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: `Clip${data.title ? ` de «${data.title}»` : ""}. Estudiante hispanohablante, nivel ${data.level} de ${data.language}. Prepara las paradas.`,
+                  },
+                  { type: "file", data: `https://www.youtube.com/watch?v=${data.videoId}`, mediaType: "video/mp4" },
+                ],
+              },
+            ],
+          }),
+        "language",
+        90_000,
+        ["google"]
+      );
+      const stops = cleanStops(object.stops as ClipStop[], data.duration);
+      console.info(`[clip] ${data.videoId}: ${object.stops.length} paradas propuestas, ${stops.length} válidas`);
+      if (stops.length < 1) {
+        throw new Error("Este clip casi no tiene diálogo que se pueda practicar. Prueba con otro.");
+      }
+      return Response.json({ summary: object.summary, spokenLanguage: object.spokenLanguage, stops });
+    }
+
     const { object } = await runWithFallback(data.provider, (model, _id, abortSignal) =>
       generateObject({
         model,
@@ -179,7 +257,10 @@ Genera el resumen, 8 frases para repetir en orden de la trama, el vocabulario cl
       "language"
     );
 
-    const videos = await searchVideos(object.videoQuery, "en", 4);
+    // Primero los clips cortos: son los que se pueden analizar y practicar con paradas.
+    const found = await searchVideos(object.videoQuery, "en", 8);
+    const fits = (v: { duration?: number }) => !!v.duration && v.duration >= 30 && v.duration <= MAX_CLIP_SECONDS;
+    const videos = [...found.filter(fits), ...found.filter((v) => !fits(v))].slice(0, 6);
     return Response.json({
       ...object,
       videos,

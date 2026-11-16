@@ -41,6 +41,7 @@ import ImageEditor from "@/components/ImageEditor";
 import CameraCapture from "@/components/CameraCapture";
 import StudyModal, { type StudyMode } from "@/components/study/StudyModal";
 import type { DecksApi } from "@/lib/useDecks";
+import { imageExtension } from "@/lib/imagePlan";
 import type { Profile } from "@/lib/languages";
 import type { ChatUIMessage, ResearchProgress } from "@/lib/types";
 import type { ChatHistoryApi } from "@/lib/chatHistory";
@@ -97,6 +98,22 @@ function hostname(url: string) {
   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; }
 }
 
+/** Convierte un SVG en PNG de 1024 px (se dibuja con las fuentes del navegador) y lo descarga. */
+async function downloadSvgAsPng(src: string, size = 1024) {
+  const img = new Image();
+  img.src = src;
+  await img.decode().catch(() => {});
+  const canvas = document.createElement("canvas");
+  const ratio = img.naturalWidth && img.naturalHeight ? img.naturalHeight / img.naturalWidth : 1;
+  canvas.width = size;
+  canvas.height = Math.round(size * ratio);
+  canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const a = document.createElement("a");
+  a.href = canvas.toDataURL("image/png");
+  a.download = "lingua-imagen.png";
+  a.click();
+}
+
 const textOfMessage = (m: ChatUIMessage) => m.parts.map((p) => (p.type === "text" ? p.text : "")).join("");
 
 function FilePart({
@@ -132,10 +149,16 @@ function FilePart({
             </button>
           )}
           {generated && (
-            <a href={part.url} download="lingua-imagen.jpg"
+            <a href={part.url} download={`lingua-imagen.${imageExtension(part.mediaType)}`}
               className="flex items-center gap-1 rounded-full bg-black/60 px-2.5 py-1 text-xs text-white hover:bg-black/80">
-              <Download className="size-3.5" /> Descargar
+              <Download className="size-3.5" /> {part.mediaType.includes("svg") ? "SVG" : "Descargar"}
             </a>
+          )}
+          {generated && part.mediaType.includes("svg") && (
+            <button type="button" onClick={() => downloadSvgAsPng(part.url)}
+              className="flex items-center gap-1 rounded-full bg-black/60 px-2.5 py-1 text-xs text-white hover:bg-black/80">
+              <Download className="size-3.5" /> PNG
+            </button>
           )}
         </div>
       </div>

@@ -10,7 +10,6 @@ import {
   Layers,
   Menu,
   MessageSquare,
-  Mic,
   Pencil,
   Search,
   Settings,
@@ -23,8 +22,7 @@ import MediaStudy from "@/components/language/MediaStudy";
 import Games from "@/components/language/Games";
 import ChatTutor from "@/components/ChatTutor";
 import ResearchPanel from "@/components/ResearchPanel";
-import VoiceConversation from "@/components/VoiceConversation";
-import PronunciationPractice from "@/components/PronunciationPractice";
+import SpeakingHub from "@/components/SpeakingHub";
 import SettingsView from "@/components/SettingsView";
 import LanguageBar from "@/components/language/LanguageBar";
 import ProgressStats from "@/components/language/ProgressStats";
@@ -41,7 +39,7 @@ import { useChatHistory, type ChatHistoryApi } from "@/lib/chatHistory";
 import { SettingsProvider } from "@/lib/settings";
 import { DEFAULT_PROFILE, type Profile } from "@/lib/languages";
 
-type Tab = "chat" | "research" | "cards" | "lessons" | "stats" | "media" | "games" | "voice" | "pronunciation" | "settings";
+type Tab = "chat" | "research" | "cards" | "lessons" | "stats" | "media" | "games" | "voice" | "settings";
 
 type Group = "study" | "language";
 
@@ -53,8 +51,7 @@ const TABS: { id: Exclude<Tab, "settings">; label: string; Icon: typeof Search; 
   { id: "stats", label: "Progreso", Icon: BarChart3, group: "language" },
   { id: "media", label: "Series y películas", Icon: Clapperboard, group: "language" },
   { id: "games", label: "Juegos", Icon: Gamepad2, group: "language" },
-  { id: "voice", label: "Charla", Icon: AudioLines, group: "language" },
-  { id: "pronunciation", label: "Pronunciación", Icon: Mic, group: "language" },
+  { id: "voice", label: "Charla y pronunciación", Icon: AudioLines, group: "language" },
 ];
 
 const GROUPS: { id: Group; label: string }[] = [
@@ -306,7 +303,7 @@ export default function Home() {
                 )}
                 {tab === "cards" && <CardsView decks={decks} provider={profile.provider} />}
                 {tab === "voice" && (
-                  <VoiceConversation profile={profile} userId={userId} onUserMessage={() => progressApi.addXp(1)} />
+                  <SpeakingHub profile={profile} userId={userId} onUserMessage={() => progressApi.addXp(1)} />
                 )}
                 {tab === "lessons" && (
                   <LessonPath
@@ -334,7 +331,6 @@ export default function Home() {
               <div className="h-full overflow-y-auto px-4 pb-8">
                 <div className="mx-auto max-w-3xl">
                   {tab === "research" && <ResearchPanel profile={profile} />}
-                  {tab === "pronunciation" && <PronunciationPractice profile={profile} />}
                   {tab === "settings" && (
                     <SettingsView
                       profile={profile}

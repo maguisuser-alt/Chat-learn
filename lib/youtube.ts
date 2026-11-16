@@ -3,6 +3,17 @@ export interface VideoResult {
   title: string;
   channel: string;
   thumbnail: string;
+  /** Duración en segundos (si se conoce). */
+  duration?: number;
+}
+
+/** "1:02:03" o "4:32" → segundos. */
+export function parseDuration(text: string | undefined): number | undefined {
+  if (!text || !/^\d+(:\d{1,2}){0,2}$/.test(text.trim())) return undefined;
+  return text
+    .trim()
+    .split(":")
+    .reduce((s, part) => s * 60 + Number(part), 0);
 }
 
 /**
@@ -74,6 +85,7 @@ async function searchScraping(query: string, lang: string, max: number) {
           videoId?: string;
           title?: { runs?: { text: string }[] };
           ownerText?: { runs?: { text: string }[] };
+          lengthText?: { simpleText?: string };
         }
       | undefined;
     if (vr?.videoId) {
@@ -82,6 +94,7 @@ async function searchScraping(query: string, lang: string, max: number) {
         title: vr.title?.runs?.[0]?.text ?? "Video",
         channel: vr.ownerText?.runs?.[0]?.text ?? "",
         thumbnail: `https://i.ytimg.com/vi/${vr.videoId}/mqdefault.jpg`,
+        duration: parseDuration(vr.lengthText?.simpleText),
       });
       return;
     }

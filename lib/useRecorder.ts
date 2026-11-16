@@ -2,10 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const MAX_MS = 15_000;
-
-/** Graba el micrófono con MediaRecorder (funciona también en Firefox y Safari). */
-export function useRecorder() {
+/** Graba el micrófono con MediaRecorder (funciona también en Firefox y Safari). `MAX_MS`: duración máxima. */
+export function useRecorder(MAX_MS = 15_000) {
   const [supported, setSupported] = useState(true);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,7 +65,7 @@ export function useRecorder() {
       );
       return null;
     }
-  }, [release]);
+  }, [release, MAX_MS]);
 
   const stop = useCallback(() => {
     if (recRef.current?.state === "recording") recRef.current.stop();

@@ -25,6 +25,8 @@ export interface VideoDTO {
   title: string;
   channel: string;
   thumbnail: string;
+  /** Duración en segundos (si se conoce). */
+  duration?: number;
 }
 
 /** Mensaje del chat: además de texto y fuentes, puede traer una parte `data-videos`. */

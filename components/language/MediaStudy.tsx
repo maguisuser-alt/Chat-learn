@@ -1,8 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { Clapperboard, Eye, EyeOff, Loader2, Mic, MicOff, RotateCcw, Volume2 } from "lucide-react";
+import { Clapperboard, ExternalLink, Eye, EyeOff, Loader2, Mic, MicOff, Play, RotateCcw, Volume2 } from "lucide-react";
 import VideoGrid from "@/components/VideoGrid";
+import VideoQuiz from "@/components/language/VideoQuiz";
+import { MAX_CLIP_SECONDS, type ClipQuiz } from "@/lib/clipQuiz";
 import StatsBar from "@/components/language/StatsBar";
 import type { Word } from "@/lib/lessons";
 import { speechCode, type Profile } from "@/lib/languages";
@@ -53,6 +55,52 @@ export default function MediaStudy({ profile, api }: { profile: Profile; api: Pr
   const [finished, setFinished] = useState(false);
   const [wordsAdded, setWordsAdded] = useState(false);
 
+  // Clip interactivo elegido.
+  const [clip, setClip] = useState<VideoDTO | null>(null);
+  const [clipQuiz, setClipQuiz] = useState<ClipQuiz | null>(null);
+  const [clipLoading, setClipLoading] = useState<string | null>(null);
+  const [clipError, setClipError] = useState<string | null>(null);
+  const [failedClip, setFailedClip] = useState<VideoDTO | null>(null);
+
+  async function openClip(v: VideoDTO) {
+    if (clipLoading) return;
+    setClipError(null);
+    setFailedClip(null);
+    const cacheKey = `lingua-clip:${profile.language}:${profile.level}:${v.id}`;
+    const cached = cacheGet<ClipQuiz>(cacheKey);
+    if (cached?.stops?.length) {
+      setClipQuiz(cached);
+      setClip(v);
+      return;
+    }
+    setClipLoading(v.id);
+    try {
+      const res = await fetch("/api/language", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "clip",
+          videoId: v.id,
+          title: data?.title ?? title,
+          duration: v.duration,
+          language: profile.language,
+          level: profile.level,
+          provider: profile.provider,
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error ?? "No se pudo preparar el clip");
+      cacheSet(cacheKey, json);
+      setClipQuiz(json as ClipQuiz);
+      setClip(v);
+    } catch (e) {
+      setClipError(e instanceof Error ? e.message : "No se pudo preparar el clip");
+      setFailedClip(v);
+    } finally {
+      setClipLoading(null);
+    }
+  }
+
   const { speak } = useSpeechSynthesis(lang);
   const rec = useSpeechRecognition(lang, (t) => {
     setHeard(t);
@@ -82,6 +130,10 @@ export default function MediaStudy({ profile, api }: { profile: Profile; api: Pr
     const cacheKey = `lingua-media:${key}`;
     restart();
     setWordsAdded(false);
+    setClip(null);
+    setClipQuiz(null);
+    setClipError(null);
+    setFailedClip(null);
     const cached = cacheGet<MediaData>(cacheKey);
     if (cached) {
       setData(cached);
@@ -229,8 +281,81 @@ export default function MediaStudy({ profile, api }: { profile: Profile; api: Pr
               )}
             </section>
 
-            {data.videos.length > 0 && (
-              <VideoGrid videos={data.videos} searchUrl={data.searchUrl} title="Mira las escenas" />
+            {/* Clips interactivos: el vídeo se detiene para preguntar o pronunciar */}
+            {clip && clipQuiz ? (
+              <VideoQuiz
+                key={clip.id}
+                video={clip}
+                quiz={clipQuiz}
+                lang={lang}
+                api={api}
+                mediaKey={mediaKey}
+                mediaTitle={data.title}
+                onExit={() => {
+                  setClip(null);
+                  setClipQuiz(null);
+                }}
+              />
+            ) : (
+              data.videos.length > 0 && (
+                <section className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-bold">Mira y practica</h3>
+                    <a href={data.searchUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs text-brand-700 hover:underline">
+                      Más en YouTube <ExternalLink className="size-3" />
+                    </a>
+                  </div>
+                  <p className="text-sm text-slate-500">
+                    Elige un clip: el vídeo se detendrá después de ciertas frases para preguntarte qué significan, completar palabras o repetirlas.
+                  </p>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {data.videos.map((v) => {
+                      const tooLong = !!v.duration && v.duration > MAX_CLIP_SECONDS;
+                      const busy = clipLoading === v.id;
+                      return (
+                        <button
+                          key={v.id}
+                          onClick={() => openClip(v)}
+                          disabled={tooLong || !!clipLoading}
+                          className="group overflow-hidden rounded-xl border border-slate-200 bg-white text-left disabled:opacity-60"
+                        >
+                          <span className="relative block">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={v.thumbnail} alt="" className="aspect-video w-full object-cover" />
+                            <span className="absolute inset-0 flex items-center justify-center bg-black/0 transition group-hover:bg-black/20">
+                              <span className="flex size-11 items-center justify-center rounded-full bg-black/70 text-white">
+                                {busy ? <Loader2 className="size-5 animate-spin" /> : <Play className="ml-0.5 size-5" fill="currentColor" />}
+                              </span>
+                            </span>
+                            {v.duration && (
+                              <span className="absolute bottom-1.5 right-1.5 rounded bg-black/75 px-1.5 text-xs font-semibold text-white">
+                                {Math.floor(v.duration / 60)}:{String(v.duration % 60).padStart(2, "0")}
+                              </span>
+                            )}
+                          </span>
+                          <span className="block p-2 text-xs">
+                            <span className="line-clamp-2 font-medium">{v.title}</span>
+                            <span className="text-slate-500">{tooLong ? "Demasiado largo para practicar" : v.channel}</span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {clipLoading && (
+                    <p className="flex items-center gap-2 text-sm text-slate-500">
+                      <Loader2 className="size-4 animate-spin" /> La IA está viendo el clip y preparando las paradas (puede tardar hasta un minuto)…
+                    </p>
+                  )}
+                  {clipError && (
+                    <div className="space-y-2 rounded-xl bg-rose-50 p-3 text-sm text-rose-700">
+                      <p>{clipError}</p>
+                      {failedClip && (
+                        <VideoGrid videos={[failedClip]} title="Puedes verlo sin ejercicios" />
+                      )}
+                    </div>
+                  )}
+                </section>
+              )
             )}
 
             {/* Shadowing: escuchar y repetir frase a frase */}

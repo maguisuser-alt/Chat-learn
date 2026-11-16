@@ -3,7 +3,43 @@ import { createOpenAI, openai } from "@ai-sdk/openai";
 import type { LanguageModel } from "ai";
 import { currentOwner, logInteraction, type InteractionEntry } from "@/lib/log";
 
-export type ProviderId = "google" | "groq" | "openrouter" | "openai";
+export type ProviderId = "google" | "groq" | "openrouter" | "zhipu" | "siliconflow" | "openai";
+
+/** Endpoint de Zhipu: bigmodel.cn (China, donde CogView-3-Flash es gratis) o api.z.ai (internacional). */
+export const zhipuBaseUrl = () => (process.env.ZHIPU_BASE_URL || "https://open.bigmodel.cn/api/paas/v4").replace(/\/+$/, "");
+
+/**
+ * GLM-4.7-Flash «piensa» antes de responder y con pocos tokens devuelve el texto
+ * vacío: se desactiva el modo de pensamiento (respuestas en 1-2 s). Con
+ * ZHIPU_THINKING=on se deja activado.
+ */
+const zhipuFetch: typeof fetch = (input, init) => {
+  if (process.env.ZHIPU_THINKING !== "on" && typeof init?.body === "string") {
+    try {
+      const body = JSON.parse(init.body);
+      if (body && typeof body === "object" && Array.isArray(body.messages)) {
+        if (!body.thinking) body.thinking = { type: "disabled" };
+        // GLM no admite response_format «json_schema»: se pide JSON simple y el esquema va como instrucción.
+        const rf = body.response_format;
+        if (rf?.type === "json_schema") {
+          const schema = rf.json_schema?.schema;
+          body.response_format = { type: "json_object" };
+          body.messages = [
+            {
+              role: "system",
+              content: `Responde SOLO con un objeto JSON válido (sin texto ni bloques de código) que cumpla este JSON Schema:\n${JSON.stringify(schema)}`,
+            },
+            ...body.messages,
+          ];
+        }
+        init = { ...init, body: JSON.stringify(body) };
+      }
+    } catch {
+      /* cuerpo no JSON: se envía tal cual */
+    }
+  }
+  return fetch(input, init);
+};
 
 interface ProviderDef {
   id: ProviderId;
@@ -49,6 +85,25 @@ const PROVIDERS: ProviderDef[] = [
     defaultModel: "meta-llama/llama-3.3-70b-instruct:free",
     create: (model, apiKey) =>
       createOpenAI({ baseURL: "https://openrouter.ai/api/v1", apiKey }).chat(model),
+  },
+  {
+    id: "zhipu",
+    label: "Zhipu GLM (China)",
+    description: "GLM-4.7-Flash gratis y sin límite de tokens; buen español y razonamiento.",
+    keyEnv: "ZHIPU_API_KEY",
+    modelEnv: "ZHIPU_MODEL",
+    defaultModel: "glm-4.7-flash",
+    create: (model, apiKey) => createOpenAI({ baseURL: zhipuBaseUrl(), apiKey, fetch: zhipuFetch }).chat(model),
+  },
+  {
+    id: "siliconflow",
+    label: "SiliconFlow (China)",
+    description: "Qwen, DeepSeek, GLM y Kimi con una sola clave; modelos ligeros gratis.",
+    keyEnv: "SILICONFLOW_API_KEY",
+    modelEnv: "SILICONFLOW_MODEL",
+    defaultModel: "Qwen/Qwen3-8B",
+    create: (model, apiKey) =>
+      createOpenAI({ baseURL: process.env.SILICONFLOW_BASE_URL || "https://api.siliconflow.com/v1", apiKey }).chat(model),
   },
   {
     id: "openai",
@@ -148,7 +203,7 @@ export function candidateModels(requested?: string): ModelCandidate[] {
 export function friendlyAIError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   if (/quota|RESOURCE_EXHAUSTED|429|rate.?limit/i.test(msg)) {
-    return "Se agotó la cuota gratuita del proveedor de IA. Espera un minuto o añade otra API key (Groq u OpenRouter) en .env.local.";
+    return "Se agotó la cuota gratuita del proveedor de IA. Espera un minuto o añade otra API key gratuita (Zhipu GLM, Groq u OpenRouter) en .env.local.";
   }
   if (/high demand|overloaded|503|UNAVAILABLE/i.test(msg)) {
     return "El modelo de IA está saturado en este momento. Inténtalo de nuevo en unos segundos.";
