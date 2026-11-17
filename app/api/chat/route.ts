@@ -19,6 +19,7 @@ import { generateImage, generateSpeech, VOICES } from "@/lib/media";
 import { detectImageIntent } from "@/lib/imageIntent";
 import { searchVideos } from "@/lib/youtube";
 import { researchWikipedia, type WikiArticle } from "@/lib/wikipedia";
+import { searchPapers, searchWeb, webSearchAvailable, type SearchHit } from "@/lib/webSearch";
 import { currentOwner, logInteraction, saveTurnIfConsented } from "@/lib/log";
 import type { ChatUIMessage, ResearchProgress } from "@/lib/types";
 
@@ -441,7 +442,8 @@ export async function POST(req: Request) {
   // Intentos: con Gemini y búsqueda disponible, primero con búsqueda web; luego
   // todos los modelos sin ella (incluidos otros proveedores). En investigación
   // profunda las fuentes ya vienen de las búsquedas propias.
-  const webSearch = !isConversation && !deep && !lastHasFiles && googleSearchAvailable();
+  // Con Exa/Tavily configurados se usan esas herramientas y no la búsqueda de Gemini (sin cuota gratuita).
+  const webSearch = !isConversation && !deep && !lastHasFiles && googleSearchAvailable() && !webSearchAvailable();
   const attempts: { candidate: ModelCandidate; search: boolean }[] = [];
   if (webSearch) {
     for (const c of candidates) if (c.provider === "google") attempts.push({ candidate: c, search: true });
@@ -515,19 +517,25 @@ ${
         const seen = new Set<string>();
         await Promise.all(
           plan.queries.map(async (q, i) => {
-            let found = await researchWikipedia(q, "es", 3);
-            if (found.length === 0) found = await researchWikipedia(q, "en", 2);
+            // Wikipedia, web (Exa → Tavily) y artículos académicos (OpenAlex), en paralelo.
+            const [wikiEs, web, papers] = await Promise.all([
+              researchWikipedia(q, "es", 2),
+              searchWeb(q, `Fuentes fiables y verificables para un informe que responda: «${question.slice(0, 400)}». Prioriza fuentes primarias, oficiales o académicas; extrae datos, cifras y fechas concretos.`),
+              searchPapers(q, 2),
+            ]);
+            const wiki = wikiEs.length ? wikiEs : await researchWikipedia(q, "en", 2);
+            const found = [...wiki, ...web.slice(0, 3), ...papers];
             for (const a of found) {
-              if (seen.has(a.url) || research.length >= 12) continue;
+              if (seen.has(a.url) || research.length >= 18) continue;
               seen.add(a.url);
-              research.push({ ...a, extract: a.extract.slice(0, 1800) });
+              research.push({ title: a.title, url: a.url, extract: a.extract.slice(0, 1800) });
             }
             progress.queries[i] = { text: q, done: true, found: found.length };
             progress.sources = research.length;
             emit();
           })
         );
-        research = research.slice(0, 12);
+        research = research.slice(0, 18);
         research.forEach((a, i) =>
           writer.write({ type: "source-url", sourceId: `src-${i + 1}`, url: a.url, title: a.title })
         );
@@ -564,6 +572,51 @@ ${
         },
       });
 
+      // Búsqueda web (Exa, con Tavily de respaldo) y académica (OpenAlex) como herramientas del modelo.
+      let searchCalls = 0;
+      const shownSources = new Set<string>();
+      const showSources = (hits: SearchHit[]) => {
+        for (const h of hits) {
+          if (shownSources.has(h.url)) continue;
+          shownSources.add(h.url);
+          writer.write({ type: "source-url", sourceId: `web-${shownSources.size}`, url: h.url, title: h.title });
+        }
+      };
+      const formatHits = (hits: SearchHit[]) =>
+        hits.slice(0, 8).map((h) => ({ titulo: h.title, url: h.url, fecha: h.published, contenido: h.extract }));
+      const objectiveField = z
+        .string()
+        .describe(
+          "Goal for this search turn; say which documents should rank first, which should be excluded, and what specific facts or figures to pull from them."
+        );
+      const webTool = tool({
+        description:
+          "Search the live web and return the most relevant URLs and content. Use for fresh information beyond the model's training data.",
+        inputSchema: z.object({ query: z.string().min(2).max(300), objective: objectiveField }),
+        execute: async ({ query, objective }) => {
+          if (++searchCalls > 4) return { error: "límite de búsquedas por mensaje" };
+          const hits = await searchWeb(query, objective);
+          showSources(hits);
+          return hits.length ? { resultados: formatHits(hits) } : { resultados: [], nota: "sin resultados" };
+        },
+      });
+      const papersTool = tool({
+        description:
+          "Search scholarly works (OpenAlex: papers, theses, books) and return titles, authors, year, citations, abstract and link. Use for academic, scientific or medical questions that need research evidence.",
+        inputSchema: z.object({ query: z.string().min(2).max(300).describe("Search terms, preferably in English") }),
+        execute: async ({ query }) => {
+          if (++searchCalls > 4) return { error: "límite de búsquedas por mensaje" };
+          const hits = await searchPapers(query);
+          showSources(hits);
+          return hits.length ? { resultados: formatHits(hits) } : { resultados: [], nota: "sin resultados" };
+        },
+      });
+      const searchTools: ToolSet =
+        !isConversation && !lastHasFiles && !deep && webSearchAvailable() ? { buscar_web: webTool, buscar_articulos: papersTool } : {};
+      if (Object.keys(searchTools).length) {
+        system += `\n\nCall buscar_web before answering unless you're certain the answer can't have changed since your training cutoff. Use buscar_articulos for questions that need academic or scientific evidence. Cite what you take from search results with the source title in brackets.`;
+      }
+
       let lastError: string | null = null;
       let tried = 0;
       let answer = "";
@@ -574,17 +627,18 @@ ${
         tried++;
         lastTried = { provider: candidate.provider, model: candidate.name };
         // La búsqueda de Google no se puede combinar con herramientas propias.
+        const ownTools: ToolSet = { ...searchTools, ...(useMemoryTool ? { guardar_memoria: memoryTool } : {}) };
         const tools: ToolSet | undefined = search
           ? { google_search: google.tools.googleSearch({}) }
-          : useMemoryTool
-            ? { guardar_memoria: memoryTool }
+          : Object.keys(ownTools).length
+            ? ownTools
             : undefined;
         const result = streamText({
           model: candidate.model,
           system,
           messages: modelMessages,
           tools,
-          stopWhen: stepCountIs(3),
+          stopWhen: stepCountIs(6),
           maxRetries: 0,
           providerOptions:
             reasoning && candidate.provider === "google"

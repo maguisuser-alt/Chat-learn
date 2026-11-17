@@ -11,6 +11,10 @@ next-env.d.ts
 *.out
 *.err
 *.tmp
+*.wav
+/img-*.png
+/img-*.svg
+/cogview-*.png
 
 # Vercel
 .vercel
