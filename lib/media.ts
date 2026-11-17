@@ -1,6 +1,6 @@
-import { generateObject } from "ai";
+import { generateObject, generateText } from "ai";
 import { z } from "zod";
-import { runWithFallback, zhipuBaseUrl } from "@/lib/ai";
+import { raceProviders, zhipuBaseUrl } from "@/lib/ai";
 import { IMAGE_KINDS, isVectorKind, sanitizeSvg, svgDataUrl } from "@/lib/imagePlan";
 
 const GEMINI = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -40,6 +40,11 @@ async function geminiImage(prompt: string, key: string): Promise<GeneratedMedia 
       state._geminiImageOffUntil = Date.now() + COOLDOWN_MS;
       return null;
     }
+    // Saturado: se pasa al vector sin probar el otro modelo y se pausa un minuto.
+    if (r.status === 503) {
+      state._geminiImageOffUntil = Date.now() + 60_000;
+      return null;
+    }
     if (!r.ok) continue;
     const j = (await r.json()) as {
       candidates?: { content?: { parts?: { inlineData?: { mimeType: string; data: string } }[] } }[];
@@ -76,8 +81,7 @@ async function planImage(request: string, context: string[]): Promise<ImagePlan>
     ? `\nPeticiones anteriores en este chat (úsalas solo si la nueva modifica o continúa una de ellas):\n${context.map((c) => `- ${c}`).join("\n")}`
     : "";
   try {
-    const { object } = await runWithFallback(
-      undefined,
+    const { object } = await raceProviders(
       (model, _id, abortSignal) =>
         generateObject({
           model,
@@ -89,12 +93,19 @@ async function planImage(request: string, context: string[]): Promise<ImagePlan>
           prompt: `Petición: «${request}»${history}`,
         }),
       "image",
-      20_000
+      25_000,
+      // Gemini planea en ~4 s; si no ha respondido a los 8 s, GLM empieza en paralelo.
+      8_000
     );
     return object;
   } catch {
-    // Sin IA de texto disponible: se usa la petición tal cual.
-    return { kind: "illustration", subject: request, text: "", style: "", palette: "", aspect: "square", symbol: "", prompt: request.slice(0, 400) };
+    // Sin IA de texto disponible: plan básico. Si es un retoque («hazlo azul»), se
+    // combina con la petición anterior para no perder de qué imagen se trata.
+    const base = context.at(-1);
+    const subject = (base ? `${base}. Cambio pedido: ${request}` : request).slice(0, 400);
+    const kind: ImagePlan["kind"] = /\b(icono|icon)\b/i.test(subject) ? "icon" : /\blogo/i.test(subject) ? "logo" : "illustration";
+    const name = /llamad[ao]\s+[«"“]?([^"»”,.\n]{2,40})/i.exec(subject)?.[1]?.trim() ?? "";
+    return { kind, subject, text: kind === "illustration" ? "" : name, style: "", palette: "", aspect: "square", symbol: "", prompt: subject };
   }
 }
 
@@ -104,31 +115,21 @@ const VIEWBOX: Record<ImagePlan["aspect"], string> = { square: "0 0 1024 1024", 
 async function vectorScene(plan: ImagePlan): Promise<GeneratedMedia | null> {
   const box = VIEWBOX[plan.aspect];
   try {
-    const { object } = await runWithFallback(
-      undefined,
-      (model, _id, abortSignal) =>
-        generateObject({
-          model,
-          maxRetries: 0,
-          abortSignal,
-          schema: z.object({ svg: z.string().describe("Documento SVG completo") }),
-          system: `Eres ilustrador digital experto en arte vectorial (estilo ilustración editorial plana, como las de Kurzgesagt o las ilustraciones de producto). Dibujas escenas completas como SVG.
+    const svg = await drawSvg(
+      `Eres ilustrador digital experto en arte vectorial (estilo ilustración editorial plana, como las de Kurzgesagt o las ilustraciones de producto). Dibujas escenas completas como SVG.
 Requisitos técnicos:
 - Un solo <svg> con xmlns y viewBox="${box}"; sin imágenes externas, sin <script>, sin <style>, sin fuentes externas.
 - Escena a sangre: fondo con degradado (<linearGradient>/<radialGradient> en <defs>), planos de profundidad (fondo, medio, primer plano), luces y sombras con formas semitransparentes.
 - Formas construidas con path y curvas Bézier, con detalles (texturas simples, brillos, siluetas reconocibles). Nada de figuras sueltas sobre fondo blanco.
 - Texto solo si se pide, con <text> y font-family="'Poppins','Montserrat','Segoe UI',Arial,sans-serif".
 - Representa fielmente el sujeto, la acción, el entorno y el estilo pedidos (si piden acuarela, imita manchas suaves con formas translúcidas superpuestas).`,
-          prompt: `Escena: ${plan.subject}
+      `Escena: ${plan.subject}
 Descripción detallada: ${plan.prompt}
 Estilo: ${plan.style || "flat vector illustration"}. Colores: ${plan.palette || "a tu elección, armónicos"}.
 ${plan.text ? `Texto exacto que debe aparecer: "${plan.text}".` : "Sin texto."}`,
-        }),
-      "image",
-      60_000
+      90_000
     );
-    const svg = sanitizeSvg(object.svg);
-    return svg ? { url: svgDataUrl(svg), mediaType: "image/svg+xml", source: "ilustración vectorial (SVG)" } : null;
+    return { url: svgDataUrl(svg), mediaType: "image/svg+xml", source: "ilustración vectorial (SVG)" };
   } catch (err) {
     console.warn("[image] ilustración SVG no disponible:", err instanceof Error ? err.message.slice(0, 160) : err);
     return null;
@@ -140,18 +141,37 @@ async function vectorImage(plan: ImagePlan): Promise<GeneratedMedia | null> {
   return isVectorKind(plan.kind) ? vectorMark(plan) : vectorScene(plan);
 }
 
+/**
+ * Pide el SVG como texto plano (no dentro de un JSON: algunos modelos, como GLM,
+ * no escapan bien un SVG largo dentro de un JSON) y lo extrae y limpia. Si un
+ * modelo no devuelve un SVG válido se prueba con el siguiente.
+ */
+async function drawSvg(system: string, prompt: string, timeoutMs: number): Promise<string> {
+  return raceProviders(
+    async (model, _id, abortSignal) => {
+      const { text } = await generateText({
+        model,
+        maxRetries: 0,
+        abortSignal,
+        system: `${system}\n\nResponde SOLO con el documento SVG completo, desde <svg hasta </svg>, sin explicaciones ni Markdown.`,
+        prompt,
+      });
+      const svg = sanitizeSvg(text);
+      if (!svg) throw new Error("la respuesta no contiene un SVG válido");
+      return svg;
+    },
+    "image",
+    timeoutMs,
+    // Gemini dibuja en ~20 s y GLM en ~50 s: GLM arranca si Gemini falla o no ha terminado a los 15 s.
+    15_000
+  );
+}
+
 /** Logo o icono como vector: el nombre sale exacto y se puede ampliar sin perder calidad. */
 async function vectorMark(plan: ImagePlan): Promise<GeneratedMedia | null> {
   try {
-    const { object } = await runWithFallback(
-      undefined,
-      (model, _id, abortSignal) =>
-        generateObject({
-          model,
-          maxRetries: 0,
-          abortSignal,
-          schema: z.object({ svg: z.string().describe("Documento SVG completo") }),
-          system: `Eres diseñador gráfico experto en identidad visual. Diseñas logos e iconos profesionales como SVG.
+    const svg = await drawSvg(
+      `Eres diseñador gráfico experto en identidad visual. Diseñas logos e iconos profesionales como SVG.
 Requisitos técnicos:
 - Un solo <svg> con xmlns, viewBox="0 0 512 512", fondo incluido (rect a sangre o forma), sin imágenes externas, sin <script>, sin <style>, sin fuentes externas.
 - Texto con <text> y font-family="'Poppins','Montserrat','Segoe UI',Arial,sans-serif"; usa text-anchor="middle" y tamaño que quepa con margen.
@@ -161,16 +181,12 @@ Diseño (nivel de estudio de branding, no plantilla):
 - Jerarquía clara: símbolo arriba (o a la izquierda), nombre grande con peso 700-800 y espaciado de letras ajustado; opcionalmente una línea de apoyo pequeña (solo si encaja con el negocio, en el idioma de la petición).
 - Paleta coherente con el negocio, con contraste suficiente para leer el nombre. Equilibrado, centrado y con margen.
 - Debe verse bien también en pequeño. Nada de clip-art genérico ni texto aleatorio.`,
-          prompt: `${plan.kind === "logo" ? "Logo" : "Icono"}: ${plan.subject}
+      `${plan.kind === "logo" ? "Logo" : "Icono"}: ${plan.subject}
 ${plan.text ? `Texto exacto que debe aparecer: "${plan.text}" (respeta mayúsculas y minúsculas).` : "Sin texto."}
 Estilo: ${plan.style || "flat minimal"}. Colores: ${plan.palette || "a tu elección"}.
 Símbolo: ${plan.symbol || plan.prompt}`,
-        }),
-      "image",
-      45_000
+      60_000
     );
-    const svg = sanitizeSvg(object.svg);
-    if (!svg) return null;
     if (plan.text && !svg.includes(plan.text.replace(/&/g, "&amp;")) && !svg.includes(plan.text)) {
       console.warn("[image] el SVG no contiene el texto pedido");
     }
@@ -245,7 +261,13 @@ async function cogviewImage(plan: ImagePlan): Promise<GeneratedMedia | null> {
 async function rasterImage(plan: ImagePlan): Promise<GeneratedMedia | null> {
   const key = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
   if (key) {
-    const img = await geminiImage(fullPrompt(plan), key);
+    // Límite propio: si Gemini no responde en 70 s se pasa al siguiente servicio.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const img = await Promise.race([
+      geminiImage(fullPrompt(plan), key).catch(() => null),
+      new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), 70_000))),
+    ]);
+    clearTimeout(timer);
     if (img) return img;
   }
   return cogviewImage(plan);
@@ -263,7 +285,17 @@ export interface GeneratedImages {
  * pintado si hay cuota y, si no, ilustración vectorial.
  */
 export async function generateImage(request: string, context: string[] = []): Promise<GeneratedImages> {
+  const t0 = Date.now();
+  const result = await createImages(request, context, t0);
+  console.info(
+    `[image] ${result.plan.kind} en ${((Date.now() - t0) / 1000).toFixed(1)} s: ${result.images.map((i) => i.source).join(" + ")}`
+  );
+  return result;
+}
+
+async function createImages(request: string, context: string[], t0: number): Promise<GeneratedImages> {
   const plan = await planImage(request, context);
+  console.info(`[image] plan (${plan.kind}) en ${((Date.now() - t0) / 1000).toFixed(1)} s`);
   if (isVectorKind(plan.kind)) {
     const [svg, art] = await Promise.allSettled([vectorImage(plan), rasterImage(plan)]);
     const images = [svg.status === "fulfilled" ? svg.value : null, art.status === "fulfilled" ? art.value : null].filter(
@@ -273,7 +305,9 @@ export async function generateImage(request: string, context: string[] = []): Pr
     throw art.status === "rejected" ? art.reason : new Error("No se pudo crear la imagen. Inténtalo de nuevo.");
   }
   // Fotos, ilustraciones y carteles: pintadas si hay cuota; si no, ilustración vectorial.
-  const art = (await rasterImage(plan)) ?? (await vectorImage(plan));
+  // El vector se empieza a la vez: si no hay imagen pintada no hay que esperar otra vez.
+  const vector = vectorImage(plan);
+  const art = (await rasterImage(plan).catch(() => null)) ?? (await vector);
   if (!art) throw new Error("No se pudo crear la imagen ahora. Inténtalo de nuevo en unos segundos.");
   return { images: [art], plan };
 }

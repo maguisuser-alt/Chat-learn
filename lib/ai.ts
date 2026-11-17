@@ -202,10 +202,16 @@ export function candidateModels(requested?: string): ModelCandidate[] {
 /** Traduce los errores habituales de las APIs a un mensaje claro en español. */
 export function friendlyAIError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
+  if (/速率限制|\b1302\b|请求频率|并发/.test(msg)) {
+    return "El proveedor de IA recibió demasiadas peticiones seguidas. Espera unos segundos e inténtalo de nuevo.";
+  }
+  if (/sin respuesta en/i.test(msg)) {
+    return "La IA tardó demasiado en responder. Inténtalo de nuevo.";
+  }
   if (/quota|RESOURCE_EXHAUSTED|429|rate.?limit/i.test(msg)) {
     return "Se agotó la cuota gratuita del proveedor de IA. Espera un minuto o añade otra API key gratuita (Zhipu GLM, Groq u OpenRouter) en .env.local.";
   }
-  if (/high demand|overloaded|503|UNAVAILABLE/i.test(msg)) {
+  if (/high demand|overloaded|503|UNAVAILABLE|访问量过大|稍后再试/i.test(msg)) {
     return "El modelo de IA está saturado en este momento. Inténtalo de nuevo en unos segundos.";
   }
   if (/API key|PERMISSION_DENIED|401|403/i.test(msg)) {
@@ -224,6 +230,68 @@ function providerChain(requested?: string): ProviderDef[] {
   return first ? [first, ...all.filter((p) => p !== first)] : all;
 }
 
+// Modelos saturados: se saltan un rato para no perder tiempo en cada petición y
+// pasar directamente al siguiente. Un 503 («high demand») tarda ~10 s en llegar;
+// un modelo que no responde puede quedarse colgado minutos, así que se pausa más.
+const OVERLOAD_MS = 2 * 60_000;
+const HUNG_MS = 5 * 60_000;
+const overload = globalThis as typeof globalThis & { _aiOverloaded?: Map<string, number> };
+const overloaded = (overload._aiOverloaded ??= new Map<string, number>());
+
+export function isOverloaded(provider: string, model: string) {
+  return Date.now() < (overloaded.get(`${provider}/${model}`) ?? 0);
+}
+
+export function markIfOverloaded(provider: string, model: string, message: string) {
+  const key = `${provider}/${model}`;
+  if (/sin respuesta en|aborted due to timeout/i.test(message)) overloaded.set(key, Date.now() + HUNG_MS);
+  else if (/high demand|overloaded|UNAVAILABLE|\b503\b|访问量过大/i.test(message)) overloaded.set(key, Date.now() + OVERLOAD_MS);
+}
+
+/**
+ * Como runWithFallback, pero el primer proveedor y los demás compiten en paralelo
+ * y gana la primera respuesta válida (la otra se cancela). Para tareas largas
+ * (dibujar un SVG, planear una imagen): si Gemini está saturado, GLM ya va
+ * avanzando en vez de esperar a que fallen todos los modelos de Gemini.
+ */
+export async function raceProviders<T>(
+  fn: (model: LanguageModel, provider: ProviderId, signal: AbortSignal) => Promise<T>,
+  kind: InteractionEntry["kind"],
+  attemptTimeoutMs: number,
+  /**
+   * Ventaja del primer proveedor: los demás solo arrancan si este falla o tarda
+   * más de esto. Así no se lanzan dos peticiones a la vez cuando no hace falta
+   * (el nivel gratuito de Zhipu rechaza peticiones simultáneas con el error 1302).
+   */
+  headStartMs: number
+): Promise<T> {
+  const ids = configuredOrder().map((p) => p.id);
+  if (ids.length < 2) return runWithFallback(undefined, fn, kind, attemptTimeoutMs);
+  const stop = new AbortController();
+  const first = runWithFallback(undefined, fn, kind, attemptTimeoutMs, [ids[0]], stop.signal);
+  const rest = (async () => {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, headStartMs);
+      first.then(
+        () => clearTimeout(timer),
+        () => {
+          clearTimeout(timer);
+          resolve();
+        }
+      );
+    });
+    if (stop.signal.aborted) throw stop.signal.reason;
+    return runWithFallback(undefined, fn, kind, attemptTimeoutMs, ids.slice(1), stop.signal);
+  })();
+  try {
+    return await Promise.any([first, rest]);
+  } catch (err) {
+    throw err instanceof AggregateError ? err.errors[0] : err;
+  } finally {
+    stop.abort(new Error("otro proveedor respondió antes"));
+  }
+}
+
 /**
  * Ejecuta `fn` con el proveedor pedido y, si falla (cuota, red, modelo), prueba
  * automáticamente con los demás proveedores configurados.
@@ -235,7 +303,9 @@ export async function runWithFallback<T>(
   kind: InteractionEntry["kind"] = "other",
   attemptTimeoutMs = 25_000,
   /** Limita los intentos a estos proveedores (p. ej. solo Gemini para audio). */
-  only?: ProviderId[]
+  only?: ProviderId[],
+  /** Corta los intentos (p. ej. porque otro proveedor ya respondió en raceProviders). */
+  stop?: AbortSignal
 ): Promise<T> {
   const chain = providerChain(requested).filter((p) => !only || only.includes(p.id));
   if (chain.length === 0) {
@@ -248,22 +318,58 @@ export async function runWithFallback<T>(
   let attempts = 0;
   let lastError: unknown;
   let lastTried = { provider: "", model: "" };
+  // Si todos los modelos están en pausa por saturación, se prueban igualmente.
+  const allCooling = chain.every((def) => modelsFor(def).every((name) => isOverloaded(def.id, name)));
   for (const def of chain) {
-    for (const name of modelsFor(def)) {
+    const names = modelsFor(def);
+    let retried = false;
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      if (stop?.aborted) throw stop.reason;
+      if (!allCooling && isOverloaded(def.id, name)) continue;
       attempts++;
       lastTried = { provider: def.id, model: name };
+      // El límite se aplica con un temporizador propio: la señal de cancelación sola
+      // no siempre corta la petición a tiempo y un modelo colgado retrasaba minutos.
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let onStop: (() => void) | undefined;
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const e = new Error(`sin respuesta en ${Math.round(attemptTimeoutMs / 1000)} s`);
+          controller.abort(e);
+          reject(e);
+        }, attemptTimeoutMs);
+        if (stop) {
+          onStop = () => {
+            controller.abort(stop.reason);
+            reject(stop.reason);
+          };
+          stop.addEventListener("abort", onStop, { once: true });
+        }
+      });
       try {
-        const result = await fn(
-          def.create(name, process.env[def.keyEnv]!),
-          def.id,
-          AbortSignal.timeout(attemptTimeoutMs)
-        );
+        const result = await Promise.race([fn(def.create(name, process.env[def.keyEnv]!), def.id, controller.signal), deadline]);
         logInteraction({ owner, kind, ...lastTried, ok: true, latencyMs: Date.now() - t0, attempts });
         return result;
       } catch (err) {
+        // Cancelado porque otro proveedor ya respondió: no es un fallo del modelo.
+        if (stop?.aborted) throw stop.reason;
         lastError = err;
         const msg = err instanceof Error ? err.message : String(err);
+        // Límite de frecuencia (Zhipu 1302): se espera un poco y se reintenta una vez el mismo modelo.
+        if (!retried && /速率限制|\b1302\b|请求频率/.test(msg)) {
+          retried = true;
+          console.warn(`[ai] ${def.id}/${name}: límite de frecuencia, reintento en 3 s`);
+          await new Promise((r) => setTimeout(r, 3_000));
+          i--;
+          continue;
+        }
+        markIfOverloaded(def.id, name, msg);
         console.warn(`[ai] ${def.id}/${name} falló, probando el siguiente: ${msg.slice(0, 160)}`);
+      } finally {
+        clearTimeout(timer);
+        if (onStop) stop?.removeEventListener("abort", onStop);
       }
     }
   }

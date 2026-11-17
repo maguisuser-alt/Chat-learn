@@ -41,6 +41,9 @@ export function detectImageIntent(message: string, previousHadImage = false): Im
   const textual = TEXTUAL.test(t);
   if (create && visual && !textual) return "image";
   if (create && visual && textual) return "maybe"; // «crea un póster con un resumen…»
+  // «dibuja un gato astronauta», «pinta un atardecer»: estos verbos ya piden algo visual
+  // (sin depender de la IA, que puede estar saturada).
+  if (!textual && /^(dibuja|dibujame|pinta|pintame|ilustra|ilustrame|draw|paint|illustrate)\b/.test(t)) return "image";
   if (create && !textual && /^(crea|creame|genera|generame|dibuja|dibujame|disena|pinta|ilustra|create|generate|draw|design|paint)\b/.test(t)) {
     // «crea un gato astronauta»: empieza pidiendo crear algo sin decir qué tipo.
     return "maybe";
