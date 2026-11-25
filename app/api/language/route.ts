@@ -38,6 +38,12 @@ const requestSchema = z.discriminatedUnion("action", [
     episode: z.string().trim().max(60).optional(),
     ...base,
   }),
+  z.object({
+    action: z.literal("song"),
+    title: z.string().trim().min(2).max(120),
+    artist: z.string().trim().max(80).default(""),
+    ...base,
+  }),
 ]);
 
 const wordSchema = z.object({
@@ -89,6 +95,27 @@ const clipSchema = z.object({
     )
     .min(1)
     .max(10),
+});
+
+const songSchema = z.object({
+  title: z.string().describe("Título oficial de la canción y artista"),
+  summary: z.string().describe("De qué trata la canción, en español, 2-3 frases"),
+  verses: z
+    .array(
+      z.object({
+        label: z.string().describe("Nombre de la parte de la canción en español: 'Intro', 'Estrofa 1', 'Estribillo', 'Puente', etc."),
+        original: z.string().describe("Verso o estribillo corto en el idioma de la canción (1-2 líneas)"),
+        translation: z.string().describe("Traducción literal al español"),
+        tip: z.string().describe("Qué enseña este fragmento: pronunciación, expresión idiomática o gramática, en español"),
+        blanks: z.array(z.string()).min(1).max(3).describe("1-3 palabras clave de este verso que se van a ocultar para el ejercicio"),
+      })
+    )
+    .min(5)
+    .max(10)
+    .describe("Fragmentos de la canción para practicar, en orden de aparición"),
+  vocabulary: z.array(wordSchema).min(5).max(10).describe("Palabras o expresiones clave de la canción"),
+  videoQuery: z.string().describe("Búsqueda de YouTube para encontrar el videoclip oficial o una versión con letra"),
+  karaokeLine: z.string().describe("El estribillo más pegadizo de la canción, en el idioma original, para mostrarlo en la pantalla final"),
 });
 
 const mediaSchema = z.object({
@@ -237,6 +264,38 @@ Reglas:
         throw new Error("Este clip casi no tiene diálogo que se pueda practicar. Prueba con otro.");
       }
       return Response.json({ summary: object.summary, spokenLanguage: object.spokenLanguage, stops });
+    }
+
+    if (data.action === "song") {
+      const { object } = await runWithFallback(data.provider, (model, _id, abortSignal) =>
+        generateObject({
+          model,
+          maxRetries: 1,
+          abortSignal,
+          schema: songSchema,
+          system: `Eres un profesor de idiomas que usa canciones para enseñar. Preparas material de práctica de "fill-in-the-blank" (completar huecos escuchando) y shadowing (escuchar y repetir).
+Reglas:
+- Usa fragmentos REALES de la canción pedida, en el orden en que aparecen (intro, estrofas, estribillo).
+- Si no conoces la letra exacta, escribe fragmentos representativos del estilo y la temática de la canción, e indícalo en el summary.
+- Los "blanks" son palabras sueltas y clave del fragmento (verbos, sustantivos, adjetivos importantes), no artículos ni preposiciones.
+- El tip debe ser útil y concreto: una nota de pronunciación, un modismo, o por qué esa estructura gramatical es importante.
+- El vocabulario son palabras o expresiones que aparecen en la canción y son útiles para el nivel del estudiante.`,
+          prompt: `Canción: «${data.title}»${data.artist ? ` de ${data.artist}` : ""}.
+Idioma de estudio: ${data.language}. Nivel del estudiante: ${data.level}.
+Prepara entre 6 y 8 fragmentos de la canción con su etiqueta (Intro, Estrofa 1, Estribillo…), traducción, tip y palabras clave para completar.`,
+        }),
+        "language"
+      );
+      const found = await searchVideos(
+        object.videoQuery || `${data.title} ${data.artist} official lyrics`,
+        "en",
+        6
+      );
+      return Response.json({
+        ...object,
+        videos: found.slice(0, 4),
+        searchUrl: `https://www.youtube.com/results?search_query=${encodeURIComponent(object.videoQuery)}`,
+      });
     }
 
     const { object } = await runWithFallback(data.provider, (model, _id, abortSignal) =>

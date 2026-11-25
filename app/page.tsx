@@ -10,6 +10,7 @@ import {
   Layers,
   Menu,
   MessageSquare,
+  Music,
   Pencil,
   Search,
   Settings,
@@ -19,6 +20,7 @@ import {
 } from "lucide-react";
 import LessonPath from "@/components/language/LessonPath";
 import MediaStudy from "@/components/language/MediaStudy";
+import SongStudy from "@/components/language/SongStudy";
 import Games from "@/components/language/Games";
 import ChatTutor from "@/components/ChatTutor";
 import ResearchPanel from "@/components/ResearchPanel";
@@ -39,7 +41,7 @@ import { useChatHistory, type ChatHistoryApi } from "@/lib/chatHistory";
 import { SettingsProvider } from "@/lib/settings";
 import { DEFAULT_PROFILE, type Profile } from "@/lib/languages";
 
-type Tab = "chat" | "research" | "cards" | "lessons" | "stats" | "media" | "games" | "voice" | "settings";
+type Tab = "chat" | "research" | "cards" | "lessons" | "stats" | "media" | "songs" | "games" | "voice" | "settings";
 
 type Group = "study" | "language";
 
@@ -50,6 +52,7 @@ const TABS: { id: Exclude<Tab, "settings">; label: string; Icon: typeof Search; 
   { id: "lessons", label: "Lecciones", Icon: GraduationCap, group: "language" },
   { id: "stats", label: "Progreso", Icon: BarChart3, group: "language" },
   { id: "media", label: "Series y películas", Icon: Clapperboard, group: "language" },
+  { id: "songs", label: "Canciones", Icon: Music, group: "language" },
   { id: "games", label: "Juegos", Icon: Gamepad2, group: "language" },
   { id: "voice", label: "Charla y pronunciación", Icon: AudioLines, group: "language" },
 ];
@@ -180,7 +183,7 @@ export default function Home() {
   const isLanguage = current?.group === "language";
 
   // Estas secciones gestionan su propio alto y scroll; el resto se envuelve con ancho de lectura.
-  const fullHeight = ["chat", "cards", "voice", "lessons", "stats", "media", "games"].includes(tab);
+  const fullHeight = ["chat", "cards", "voice", "lessons", "stats", "media", "songs", "games"].includes(tab);
 
   return (
     <SettingsProvider userId={userId} sync={cloud}>
@@ -325,6 +328,7 @@ export default function Home() {
                   />
                 )}
                 {tab === "media" && <MediaStudy profile={profile} api={progressApi} />}
+                {tab === "songs" && <SongStudy profile={profile} api={progressApi} />}
                 {tab === "games" && <Games profile={profile} api={progressApi} />}
               </>
             ) : (
